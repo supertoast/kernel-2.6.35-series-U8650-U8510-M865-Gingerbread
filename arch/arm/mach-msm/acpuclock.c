@@ -17,8 +17,6 @@
  *
  */
 
-#define OVERCLOCK_AHB
-
 #include <linux/version.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -61,8 +59,7 @@ enum {
 	ACPU_PLL_END,
 };
 
-struct clock_state
-{
+struct clock_state {
 	struct clkctl_acpu_speed	*current_speed;
 	struct mutex			lock;
 	uint32_t			acpu_switch_time_us;
@@ -265,6 +262,7 @@ static struct clkctl_acpu_speed pll0_960_pll1_196_pll2_1200[] = {
 #define PLL_245_MHZ	12
 #define PLL_491_MHZ	25
 #define PLL_768_MHZ	40
+#define PLL_800_MHZ	41
 #define PLL_960_MHZ	50
 #define PLL_1056_MHZ	55
 #define PLL_1200_MHZ	62
@@ -422,7 +420,8 @@ static int acpuclk_set_vdd_level(int vdd)
 }
 
 /* Set proper dividers for the given clock speed. */
-static void acpuclk_set_div(const struct clkctl_acpu_speed *hunt_s) {
+static void acpuclk_set_div(const struct clkctl_acpu_speed *hunt_s)
+{
 	uint32_t reg_clkctl, reg_clksel, clk_div, src_sel;
 
 	reg_clksel = readl(A11S_CLK_SEL_ADDR);
@@ -706,6 +705,9 @@ static void __init acpuclk_init(void)
 	}
 
 	drv_state.current_speed = speed;
+	if (speed->pll != ACPU_PLL_TCXO)
+		if (pc_pll_request(speed->pll, 1))
+			pr_warning("Failed to vote for boot PLL\n");
 
 	res = ebi1_clk_set_min_rate(CLKVOTE_ACPUCLK, speed->axiclk_khz * 1000);
 	if (res < 0)
@@ -793,7 +795,7 @@ static void __init acpu_freq_tbl_fixup(void)
 	 * the max that's supported by the board (RAM used in board).
 	 */
 	axi_160mhz = (pll0_l == PLL_960_MHZ || pll1_l == PLL_960_MHZ);
-	axi_200mhz = (pll2_l == PLL_1200_MHZ);
+	axi_200mhz = (pll2_l == PLL_1200_MHZ || pll2_l == PLL_800_MHZ);
 	for (t = &acpu_freq_tbl[0]; t->a11clk_khz != 0; t++) {
 
 		if (pll0_needs_fixup && t->pll == ACPU_PLL_0)
@@ -948,6 +950,8 @@ void __init msm_acpu_clock_init(struct msm_acpu_clock_platform_data *clkdata)
 	pr_info("acpu_clock_init()\n");
 
 	mutex_init(&drv_state.lock);
+	if (cpu_is_msm7x27())
+		shared_pll_control_init();
 	drv_state.acpu_switch_time_us = clkdata->acpu_switch_time_us;
 	drv_state.max_speed_delta_khz = clkdata->max_speed_delta_khz;
 	drv_state.vdd_switch_time_us = clkdata->vdd_switch_time_us;
@@ -959,8 +963,6 @@ void __init msm_acpu_clock_init(struct msm_acpu_clock_platform_data *clkdata)
 	acpuclk_init();
 	lpj_init();
 	print_acpu_freq_tbl();
-	if (cpu_is_msm7x27())
-		shared_pll_control_init();
 #ifdef CONFIG_CPU_FREQ_MSM
 	cpufreq_table_init();
 	cpufreq_frequency_table_get_attr(freq_table, smp_processor_id());
