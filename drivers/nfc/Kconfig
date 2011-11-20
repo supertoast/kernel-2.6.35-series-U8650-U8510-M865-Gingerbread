@@ -1,0 +1,12 @@
+#
+# Near Field Communication (NFC) devices
+#
+
+config HUAWEI_NFC_PN544
+	default n
+	bool "HUAWEI NFC PN544"
+	help
+		Say yes if you want PN544 Near Field Communication driver.
+		This is for i2c connected version. If unsure, say N here.
+
+

@@ -1,0 +1,242 @@
+/*
+ * DECnet       An implementation of the DECnet protocol suite for the LINUX
+ *              operating system.  DECnet is implemented using the  BSD Socket
+ *              interface as the means of communication with the user level.
+ *
+ *              DECnet Routing Forwarding Information Base (Glue/Info List)
+ *
+ * Author:      Steve Whitehouse <SteveW@ACM.org>
+ *
+ *
+ * Changes:
+ *              Alexey Kuznetsov : SMP locking changes
+ *              Steve Whitehouse : Rewrote it... Well to be more correct, I
+ *                                 copied most of it from the ipv4 fib code.
+ *              Steve Whitehouse : Updated it in style and fixed a few bugs
+ *                                 which were fixed in the ipv4 code since
+ *                                 this code was copied from it.
+ *
+ */
+#include <linux/string.h>
+#include <linux/net.h>
+#include <linux/socket.h>
+#include <linux/slab.h>
+#include <linux/sockios.h>
+#include <linux/init.h>
+#include <linux/skbuff.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/proc_fs.h>
+#include <linux/netdevice.h>
+#include <linux/timer.h>
+#include <linux/spinlock.h>
+#include <asm/atomic.h>
+#include <asm/uaccess.h>
+#include <net/neighbour.h>
+#include <net/dst.h>
+#include <net/flow.h>
+#include <net/fib_rules.h>
+#include <net/dn.h>
+#include <net/dn_route.h>
+#include <net/dn_fib.h>
+#include <net/dn_neigh.h>
+#include <net/dn_dev.h>
+
+#define RT_MIN_TABLE 1
+
+#define for_fib_info() { struct dn_fib_info *fi;\
+	for(fi = dn_fib_info_list; fi; fi = fi->fib_next)
+#define endfor_fib_info() }
+
+#define for_nexthops(fi) { int nhsel; const struct dn_fib_nh *nh;\
+	for(nhsel = 0, nh = (fi)->fib_nh; nhsel < (fi)->fib_nhs; nh++, nhsel++)
+
+#define change_nexthops(fi) { int nhsel; struct dn_fib_nh *nh;\
+	for(nhsel = 0, nh = (struct dn_fib_nh *)((fi)->fib_nh); nhsel < (fi)->fib_nhs; nh++, nhsel++)
+
+#define endfor_nexthops(fi) }
+
+static DEFINE_SPINLOCK(dn_fib_multipath_lock);
+static struct dn_fib_info *dn_fib_info_list;
+static DEFINE_SPINLOCK(dn_fib_info_lock);
+
+static struct
+{
+	int error;
+	u8 scope;
+} dn_fib_props[RTN_MAX+1] = {
+	[RTN_UNSPEC] =      { .error = 0,       .scope = RT_SCOPE_NOWHERE },
+	[RTN_UNICAST] =     { .error = 0,       .scope = RT_SCOPE_UNIVERSE },
+	[RTN_LOCAL] =       { .error = 0,       .scope = RT_SCOPE_HOST },
+	[RTN_BROADCAST] =   { .error = -EINVAL, .scope = RT_SCOPE_NOWHERE },
+	[RTN_ANYCAST] =     { .error = -EINVAL, .scope = RT_SCOPE_NOWHERE },
+	[RTN_MULTICAST] =   { .error = -EINVAL, .scope = RT_SCOPE_NOWHERE },
+	[RTN_BLACKHOLE] =   { .error = -EINVAL, .scope = RT_SCOPE_UNIVERSE },
+	[RTN_UNREACHABLE] = { .error = -EHOSTUNREACH, .scope = RT_SCOPE_UNIVERSE },
+	[RTN_PROHIBIT] =    { .error = -EACCES, .scope = RT_SCOPE_UNIVERSE },
+	[RTN_THROW] =       { .error = -EAGAIN, .scope = RT_SCOPE_UNIVERSE },
+	[RTN_NAT] =         { .error = 0,       .scope = RT_SCOPE_NOWHERE },
+	[RTN_XRESOLVE] =    { .error = -EINVAL, .scope = RT_SCOPE_NOWHERE },
+};
+
+static int dn_fib_sync_down(__le16 local, struct net_device *dev, int force);
+static int dn_fib_sync_up(struct net_device *dev);
+
+void dn_fib_free_info(struct dn_fib_info *fi)
+{
+	if (fi->fib_dead == 0) {
+		printk(KERN_DEBUG "DECnet: BUG! Attempt to free alive dn_fib_info\n");
+		return;
+	}
+
+	change_nexthops(fi) {
+		if (nh->nh_dev)
+			dev_put(nh->nh_dev);
+		nh->nh_dev = NULL;
+	} endfor_nexthops(fi);
+	kfree(fi);
+}
+
+void dn_fib_release_info(struct dn_fib_info *fi)
+{
+	spin_lock(&dn_fib_info_lock);
+	if (fi && --fi->fib_treeref == 0) {
+		if (fi->fib_next)
+			fi->fib_next->fib_prev = fi->fib_prev;
+		if (fi->fib_prev)
+			fi->fib_prev->fib_next = fi->fib_next;
+		if (fi == dn_fib_info_list)
+			dn_fib_info_list = fi->fib_next;
+		fi->fib_dead = 1;
+		dn_fib_info_put(fi);
+	}
+	spin_unlock(&dn_fib_info_lock);
+}
+
+static inline int dn_fib_nh_comp(const struct dn_fib_info *fi, const struct dn_fib_info *ofi)
+{
+	const struct dn_fib_nh *onh = ofi->fib_nh;
+
+	for_nexthops(fi) {
+		if (nh->nh_oif != onh->nh_oif ||
+			nh->nh_gw != onh->nh_gw ||
+			nh->nh_scope != onh->nh_scope ||
+			nh->nh_weight != onh->nh_weight ||
+			((nh->nh_flags^onh->nh_flags)&~RTNH_F_DEAD))
+				return -1;
+		onh++;
+	} endfor_nexthops(fi);
+	return 0;
+}
+
+static inline struct dn_fib_info *dn_fib_find_info(const struct dn_fib_info *nfi)
+{
+	for_fib_info() {
+		if (fi->fib_nhs != nfi->fib_nhs)
+			continue;
+		if (nfi->fib_protocol == fi->fib_protocol &&
+			nfi->fib_prefsrc == fi->fib_prefsrc &&
+			nfi->fib_priority == fi->fib_priority &&
+			memcmp(nfi->fib_metrics, fi->fib_metrics, sizeof(fi->fib_metrics)) == 0 &&
+			((nfi->fib_flags^fi->fib_flags)&~RTNH_F_DEAD) == 0 &&
+			(nfi->fib_nhs == 0 || dn_fib_nh_comp(fi, nfi) == 0))
+				return fi;
+	} endfor_fib_info();
+	return NULL;
+}
+
+__le16 dn_fib_get_attr16(struct rtattr *attr, int attrlen, int type)
+{
+	while(RTA_OK(attr,attrlen)) {
+		if (attr->rta_type == type)
+			return *(__le16*)RTA_DATA(attr);
+		attr = RTA_NEXT(attr, attrlen);
+	}
+
+	return 0;
+}
+
+static int dn_fib_count_nhs(struct rtattr *rta)
+{
+	int nhs = 0;
+	struct rtnexthop *nhp = RTA_DATA(rta);
+	int nhlen = RTA_PAYLOAD(rta);
+
+	while(nhlen >= (int)sizeof(struct rtnexthop)) {
+		if ((nhlen -= nhp->rtnh_len) < 0)
+			return 0;
+		nhs++;
+		nhp = RTNH_NEXT(nhp);
+	}
+
+	return nhs;
+}
+
+static int dn_fib_get_nhs(struct dn_fib_info *fi, const struct rtattr *rta, const struct rtmsg *r)
+{
+	struct rtnexthop *nhp = RTA_DATA(rta);
+	int nhlen = RTA_PAYLOAD(rta);
+
+	change_nexthops(fi) {
+		int attrlen = nhlen - sizeof(struct rtnexthop);
+		if (attrlen < 0 || (nhlen -= nhp->rtnh_len) < 0)
+			return -EINVAL;
+
+		nh->nh_flags  = (r->rtm_flags&~0xFF) | nhp->rtnh_flags;
+		nh->nh_oif    = nhp->rtnh_ifindex;
+		nh->nh_weight = nhp->rtnh_hops + 1;
+
+		if (attrlen) {
+			nh->nh_gw = dn_fib_get_attr16(RTNH_DATA(nhp), attrlen, RTA_GATEWAY);
+		}
+		nhp = RTNH_NEXT(nhp);
+	} endfor_nexthops(fi);
+
+	return 0;
+}
+
+
+static int dn_fib_check_nh(const struct rtmsg *r, struct dn_fib_info *fi, struct dn_fib_nh *nh)
+{
+	int err;
+
+	if (nh->nh_gw) {
+		struct flowi fl;
+		struct dn_fib_res res;
+
+		if (nh->nh_flags&RTNH_F_ONLINK) {
+			struct net_device *dev;
+
+			if (r->rtm_scope >= RT_SCOPE_LINK)
+				return -EINVAL;
+			if (dnet_addr_type(nh->nh_gw) != RTN_UNICAST)
+				return -EINVAL;
+			if ((dev = __dev_get_by_index(&init_net, nh->nh_oif)) == NULL)
+				return -ENODEV;
+			if (!(dev->flags&IFF_UP))
+				return -ENETDOWN;
+			nh->nh_dev = dev;
+			dev_hold(dev);
+			nh->nh_scope = RT_SCOPE_LINK;
+			return 0;
+		}
+
+		memset(&fl, 0, sizeof(fl));
+		fl.fld_dst = nh->nh_gw;
+		fl.oif = nh->nh_oif;
+		fl.fld_scope = r->rtm_scope + 1;
+
+		if (fl.fld_scope < RT_SCOPE_LINK)
+			fl.fld_scope = RT_SCOPE_LINK;
+
+		if ((err = dn_fib_lookup(&fl, &res)) != 0)
+			return err;
+
+		err = -EINVAL;
+		if (res.type != RTN_UNICAST && res.type != RTN_LOCAL)
+			goto out;
+		nh->nh_scope = res.scope;
+		nh->nh_oif = DN_FIB_RES_OIF(res);
+		nh->nh_dev = DN_FIB_RES_DEV(res);
+		if (nh->nh_dev == NULL)
+			goto out;
