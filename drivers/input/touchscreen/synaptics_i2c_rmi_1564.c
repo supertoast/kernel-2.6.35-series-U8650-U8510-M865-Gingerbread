@@ -462,6 +462,7 @@ static void synaptics_rmi4_work_func(struct work_struct *work)
 			__u8 finger_status_reg = 0;
 			__u8 fsr_len = (ts->f11.points_supported + 3) / 4;
 			int touch = 0;
+            int hadTouch = 0;
             TS_DEBUG_RMI("f11.points_supported is %d\n",ts->f11.points_supported);
             if(ts->is_support_multi_touch)
             {
@@ -471,8 +472,7 @@ static void synaptics_rmi4_work_func(struct work_struct *work)
                 {
 
                     if (!(f % 4))
-
-                    finger_status_reg = f11_data[f / 4];
+                        finger_status_reg = f11_data[f / 4];
 
                     finger_status = (finger_status_reg >> ((f % 4) * 2)) & 3;
 
@@ -493,9 +493,8 @@ static void synaptics_rmi4_work_func(struct work_struct *work)
                 for (f = 0; f < ts->f11.points_supported; ++f) 
                 {
 
-                	if (!(f % 4))
-                        
-                	finger_status_reg = f11_data[f / 4];
+                	if (!(f % 4))                        
+                        finger_status_reg = f11_data[f / 4];
 
                 	finger_status = (finger_status_reg >> ((f % 4) * 2)) & 3;
 
@@ -530,21 +529,29 @@ static void synaptics_rmi4_work_func(struct work_struct *work)
                     {
                         y = ( y * jisuan ) / ts_y_max;
                     }
-                   
-                    DBG_MASK("the x is %d the y is %d the stauts is %d!\n",x,y,finger_status);
-                	/* Linux 2.6.31 multi-touch */
-                	input_report_abs(ts->input_dev, ABS_MT_TRACKING_ID, f);
-                	input_report_abs(ts->input_dev, ABS_MT_POSITION_X, x);
-                	input_report_abs(ts->input_dev, ABS_MT_POSITION_Y, y);
-                	input_report_abs(ts->input_dev, ABS_MT_TOUCH_MAJOR, z);
-                	input_report_abs(ts->input_dev, ABS_MT_TOUCH_MINOR, min(wx, wy));
-                	input_report_abs(ts->input_dev, ABS_MT_ORIENTATION, (wx > wy ? 1 : 0));
-                    input_report_abs(ts->input_dev, ABS_MT_WIDTH_MAJOR, z);
-                    input_mt_sync(ts->input_dev);  
-                    DBG_MASK("the touch inout is ok!\n");
-                    /*we don't use the CONFIG_HUAWEI_TOUCHSCREEN_EXTRA_KEY so delete all the CONFIG_HUAWEI_TOUCHSCREEN_EXTRA_KEY code*/
-                    ts->f11_fingers[f].status = finger_status;
-                    input_report_key(ts->input_dev, BTN_TOUCH, touch);
+
+                    DBG_MASK("the x is %d the y is %d the status is %d!\n",x,y,finger_status);
+                    if (finger_status == 1)
+                    {
+                        input_report_abs(ts->input_dev, ABS_MT_TRACKING_ID, f);
+                        input_report_abs(ts->input_dev, ABS_MT_POSITION_X, x);
+                        input_report_abs(ts->input_dev, ABS_MT_POSITION_Y, y);
+                        //input_report_abs(ts->input_dev, ABS_MT_TOUCH_MAJOR, z);
+                        input_report_abs(ts->input_dev, ABS_MT_TOUCH_MINOR, min(wx, wy));
+                        input_report_abs(ts->input_dev, ABS_MT_ORIENTATION, (wx > wy ? 1 : 0));
+                        input_report_abs(ts->input_dev, ABS_MT_WIDTH_MAJOR, z);
+                        input_report_abs(ts->input_dev, ABS_MT_PRESSURE, 255);
+                        input_report_key(ts->input_dev, BTN_TOUCH, finger_status);
+                        input_mt_sync(ts->input_dev);
+                        DBG_MASK("the touch inout is ok!\n");
+                        ts->f11_fingers[f].status = finger_status;
+                        hadTouch = 1;                    
+                    }                                       
+                }
+
+                if (hadTouch == 0)
+                {
+                    input_mt_sync(ts->input_dev);
                 }
             }
             else /* else with "if(ts->is_support_multi_touch)"*/
